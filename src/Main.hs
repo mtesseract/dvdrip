@@ -4,6 +4,8 @@
 {-# LANGUAGE TypeFamilies           #-}
 {-# LANGUAGE TemplateHaskell        #-}
 {-# LANGUAGE FlexibleContexts       #-}
+{-# LANGUAGE OverloadedStrings      #-}
+{-# LANGUAGE MultiWayIf             #-}
 
 module Main where
 
@@ -15,7 +17,7 @@ import Control.Concurrent.Async.Timer
 import Control.Concurrent.Async.Lifted.Safe (poll)
 import Data.Function ((&))
 import System.IO (hFlush, stdout, stderr)
-import System.Process hiding (env)
+import System.Process.ByteString
 import System.Exit
 import Numeric (readHex)
 import System.IO.Temp (withSystemTempDirectory)
@@ -26,6 +28,7 @@ import qualified Data.Text as Text
 import qualified Options.Applicative as Opts
 import Control.Lens
 import Control.Arrow ((>>>))
+import Data.List.NonEmpty (NonEmpty(..))
 import Paths_dvdrip
 
 data DvdInfo =
@@ -49,16 +52,22 @@ data DvdripEnv =
   DvdripEnv { _dvdripEnvOptions    :: DvdripOptions
             , _dvdripEnvOffset     :: Maybe Int
             , _dvdripEnvWorkingDir :: FilePath
-            , _dvdripEnvLanguages  :: Maybe [Text] }
+            , _dvdripEnvLanguages  :: Maybe [Text]
+            , _dvdripEnvTracks     :: Maybe [Int]}
 
 data DvdripOptions =
-  DvdripOptions { _dvdripOptionsDvdFile      :: Maybe FilePath
-                , _dvdripOptionsOutputDir    :: Maybe FilePath
-                , _dvdripOptionsDvdName      :: Maybe Text
-                , _dvdripOptionsTempDir      :: Maybe FilePath
-                , _dvdripOptionsOffset       :: Maybe Text
-                , _dvdripOptionsFormatString :: Maybe Text
-                , _dvdripOptionsLanguages    :: Maybe Text
+  DvdripOptions { _dvdripOptionsDvdFile        :: Maybe FilePath
+                , _dvdripOptionsOutputDir      :: Maybe FilePath
+                , _dvdripOptionsDvdName        :: Maybe Text
+                , _dvdripOptionsTempDir        :: Maybe FilePath
+                , _dvdripOptionsOffset         :: Maybe Text
+                , _dvdripOptionsFormatString   :: Maybe Text
+                , _dvdripOptionsLanguages      :: Maybe Text
+                , _dvdripOptionsScpDestination :: Maybe Text
+                , _dvdripOptionsDebugging      :: Bool
+                , _dvdripOptionsAnalyze        :: Bool
+                , _dvdripOptionsTracks         :: Maybe Text
+                , _dvdripOptionsVersion        :: Bool
                 }
 
 data CustomFormat = CustomFormatLiteral Text
@@ -79,6 +88,22 @@ instance Show DvdException where
 
 instance Exception DvdException
 
+-- | The name of the program.
+programName :: String
+programName = "dvdrip"
+
+-- | The version of the program.
+programVersion :: String
+programVersion = showVersion Paths_dvdrip.version
+
+-- | Short description of the program.
+programDescriptionShort :: String
+programDescriptionShort = "Video DVD Ripper"
+
+-- | Short description of the program.
+programDescription :: String
+programDescription = "Command line wrapper for lsdvd, dvdbackup and ffmpeg"
+
 parseHexadecimal :: Text -> Maybe Int
 parseHexadecimal s = do
   let (prefix, rest) = (take 2 s, drop 2 s)
@@ -94,18 +119,22 @@ extractNodeElement (NodeElement elt) =
 extractNodeElement _ =
   throwM (DvdException "Node does not define an Element")
 
-retrieveDvdInfo :: (MonadThrow m, MonadIO m)
+retrieveDvdInfo :: (MonadReader DvdripEnv m, MonadThrow m, MonadIO m)
                 => FilePath -> m DvdInfo
 retrieveDvdInfo inputFile = do
-  (cmdExit, cmdStdout, _) <- liftIO $
-    readProcessWithExitCode "lsdvd" ["-a", "-Ox", inputFile] ""
-  require "Process exit with failure: lsdvd" $
-    cmdExit == ExitSuccess
-  parseDvdInfo $ pack cmdStdout
-
-parseDvdInfo :: MonadThrow m => LText -> m DvdInfo
-parseDvdInfo t = do
-  Document _ root _ <- either throwM return $ parseText def t
+  let cmd  = "lsdvd"
+      args = ["-a", "-Ox", inputFile]
+  logDbg $ sformat ("lsdvd command: " % string % " " % string) cmd (unwords args)
+  (cmdExit, cmdStdout, cmdStderr) <- liftIO $ readProcessWithExitCode cmd args ""
+  when (cmdExit /= ExitSuccess) $ do
+    logErr "Process exit with failure: lsdvd"
+    logErr "Standard error output follows:"
+    liftIO $ hPutStrLn stderr cmdStderr
+  parseDvdInfo cmdStdout
+  
+parseDvdInfo :: (MonadReader DvdripEnv m, MonadThrow m) => ByteString -> m DvdInfo
+parseDvdInfo bs = do
+  Document _ root _ <- either throwM return $ parseLBS def (fromStrict bs)
   require "Node not found: lsdvd" $
     (nameLocalName . elementName) root == "lsdvd"
   let subNodes = elementNodes root
@@ -189,14 +218,14 @@ listToMap as = Map.fromList $ zip [1..] as
 
 trackLengthThreshold :: Map Int Track -> Double
 trackLengthThreshold videoTracks =
-  let trackLengths = map snd $ Map.toList $ Map.map (^. trackLength) videoTracks
-      trackLengthTotal = sum trackLengths
-      nTracks = length videoTracks
-      avgTrackLength = if nTracks == 0
-                       then 0
-                       else trackLengthTotal / fromIntegral nTracks
-  in avgTrackLength / 2
-
+  let videoTracks' = map (view trackLength . snd) $ Map.toList videoTracks
+  in case videoTracks' of
+       firstTrack : restTracks -> maximum (nonNullTracks firstTrack restTracks) / 2
+       [] -> 0
+  where nonNullTracks :: Double -> [Double] -> NonNull [Double]
+        nonNullTracks firstTrack restTracks =
+          fromNonEmpty (firstTrack :| restTracks)
+  
 filterTracks :: Map Int Track -> Map Int Track
 filterTracks videoTracks =
   let threshold = trackLengthThreshold videoTracks
@@ -220,35 +249,72 @@ dumpTracks videoTracks =
                     "  " ++ lang ++ " -> " ++ tshow (audioStream ^. streamId))
           . Map.toList
 
+dumpTracksCompact :: Map Int Track -> Text
+dumpTracksCompact videoTracks =
+  let videoTracks' = sortBy (on compare fst) $ Map.toList videoTracks
+  in concatMap (dumpTrack . snd) videoTracks'
+
+  where dumpTrack t =
+          let langs = intercalate ", " (Map.keys (t ^. audio))
+          in sformat ("[Track #" % int % "] length = " % float % "min" % stext % "\n")
+             (t ^. trackId)
+             (t ^. trackLength)
+             (if null langs
+              then ""
+              else sformat (", languages = " % stext) langs)
+
 createCustomFormatDict :: MonadReader DvdripEnv m
                        => DvdInfo -> Int -> m (Map Text Text)
 createCustomFormatDict dvd idx = do
   name <- (fromMaybe (dvd ^. title) . view (options . dvdName)) <$> ask
   return $ Map.fromList [ ("i", tshow idx)
                         , ("t", name) ]
-
-ripTrack :: (MonadIO m, MonadReader DvdripEnv m, MonadThrow m)
+processTrack :: (MonadIO m, MonadReader DvdripEnv m, MonadCatch m)
          => FilePath -> Text -> Track -> m ()
-ripTrack tmpDir outputName track = do
+processTrack tmpDir outputName track = do
+  logDbg $ sformat "Processing track"
+  env <- ask
   inputFile <- dvdripDvdFile
   outDir <- dvdripOutputDir
-  let tmpDirVob = tmpDir </> "VOB"
-      outputNameSuffixed = unpack outputName ++ "." ++ suffix
-      tmpOutputFile = tmpDir </> outputNameSuffixed
+  let outputNameSuffixed = unpack outputName ++ "." ++ suffix
       outputFile = outDir </> outputNameSuffixed
+
+  ripTrack tmpDir outDir inputFile outputNameSuffixed track
+  maybe (return ()) (sendFile outputFile) (env ^. options . scpDestination)
+  where suffix = "mkv"
+
+sendFile :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
+sendFile file scpDest =
+  (liftIO $ withActivityIcon' $
+    readProcessWithExitCode "scp" ["-q", file, unpack scpDest]) "" >>= \case
+    Right (cmdExit, _, cmdStderr) ->
+      when (cmdExit /= ExitSuccess) $ do
+      logErr "Failed to transmit encoded file via scp."
+      logErr "Standard error output follows:"
+      hPutStrLn stderr cmdStderr
+      throwM (DvdException "Failed command: scp")
+    Left exn -> throwM exn
+  
+
+ripTrack :: (MonadIO m, MonadReader DvdripEnv m, MonadCatch m)
+         => FilePath -> FilePath -> FilePath -> FilePath -> Track -> m ()
+ripTrack tmpDir outDir inputFile outputName track = do
+  let tmpDirVob = tmpDir </> "VOB"
+      tmpOutputFile = tmpDir </> outputName
+      outputFile = outDir </> outputName
   liftIO $ unlessM (doesDirectoryExist tmpDirVob) $
     createDirectory tmpDirVob
   logMsg $
     sformat ("Ripping track no. " % int) (track ^. trackId)
-  dvdBackupRes <- liftIO $
-    withActivityIcon' (dvdBackup track inputFile tmpDirVob)
+  dvdBackupRes <- try $ dvdBackup track inputFile tmpDirVob
   case dvdBackupRes of
     Right (dvdBackupExit, _, dvdBackupStderr) ->
       when (dvdBackupExit /= ExitSuccess) $ do
-      logErr "Failed to retrieve VOB data from DVD, dumping stderr:"
-      logErr (pack dvdBackupStderr)
+      logErr "Failed to retrieve VOB data from DVD, dumping stderr."
+      logErr "Standard error output follows:"
+      hPutStrLn stderr dvdBackupStderr
       throwM (DvdException "Failed command: dvdbackup")
-    Left exn -> throwM exn
+    Left exn -> throwM (exn :: SomeException)
   vobFiles <- retrieveVobFiles tmpDirVob
   maybeAudioTrack <- retrieveAudioTrack track
   audioTrack <- maybe (throwM (DvdException "Failed to find audio stream"))
@@ -258,20 +324,18 @@ ripTrack tmpDir outputName track = do
     sformat ("Found audio stream: " % stext) (audioTrack ^. language)
   logMsg $
     sformat ("Encoding track no. " % int) (track ^. trackId)
-  tracksEncodeRes <- liftIO $
-    withActivityIcon' (trackEncode audioTrack vobFiles tmpOutputFile)
+  tracksEncodeRes <- try $ trackEncode audioTrack vobFiles tmpOutputFile
   case tracksEncodeRes of
     Right (cmdExit, _, cmdStderr) ->
       when (cmdExit /= ExitSuccess) $ do
-      logErr "Failed to encode VOB data, dumping stderr:"
-      logErr (pack cmdStderr)
+      logErr "Failed to encode VOB data, dumping stderr."
+      logErr "Standard error output follows:"
+      hPutStrLn stderr cmdStderr
       throwM (DvdException "Failed command: ffmpeg")
-    Left exn -> throwM exn
+    Left exn -> throwM (exn :: SomeException)
   logMsg $
     sformat ("Written file: " % string) outputFile
   liftIO $ renameFile tmpOutputFile outputFile
-
-  where suffix = "mkv"
 
 retrieveAudioTrack :: MonadReader DvdripEnv m
                    => Track -> m (Maybe TrackAudio)
@@ -282,25 +346,38 @@ retrieveAudioTrack track = ask <&>
    >>> catMaybes
    >>> listToMaybe)
 
-dvdBackup :: MonadIO m
-          => Track -> FilePath -> FilePath -> m (ExitCode, String, String)
-dvdBackup track inputFile outDir = liftIO $
-  readProcessWithExitCode
-    "dvdbackup" ["-t", show (track ^. trackId), "-i", inputFile, "-o", outDir] ""
+dvdBackup :: (MonadReader DvdripEnv m, MonadThrow m, MonadIO m)
+          => Track -> FilePath -> FilePath -> m (ExitCode, ByteString, ByteString)
+dvdBackup track inputFile outDir = do
+  let cmd  = "dvdbackup"
+      args = ["-t", show (track ^. trackId), "-i", inputFile, "-o", outDir]
+  logDbg $ sformat (string % " " % string) cmd (unwords args)
+  liftIO (withActivityIcon' (readProcessWithExitCode cmd args "")) >>= \case
+    Right a  -> return a
+    Left exn -> throwM exn
 
-trackEncode :: MonadIO m
-            => TrackAudio -> [FilePath] -> FilePath -> m (ExitCode, String, String)
-trackEncode audioTrack inputFiles outputFile = liftIO $ do
-  let inputFileSpec = constructVobFilesSpec inputFiles
+trackEncode :: (MonadIO m, MonadThrow m, MonadReader DvdripEnv m)
+            => TrackAudio -> [FilePath] -> FilePath -> m (ExitCode, ByteString, ByteString)
+trackEncode audioTrack inputFiles outputFile = do
+  let inputFileSpec   = constructVobFilesSpec inputFiles
       audioStreamSpec = "0:i:" ++ show (audioTrack ^. streamId)
-  readProcessWithExitCode
-    "ffmpeg" [ "-y"
+      cmd = "ffmpeg"
+      args = [ "-y"
              , "-i", inputFileSpec
              , "-map", "0:v"
              , "-c:v", "libx264"
              , "-map", audioStreamSpec
-             , outputFile ] ""
+             , outputFile ]
+  logDbg $ sformat (string % " " % string) cmd (unwords args)
+  liftIO (withActivityIcon' (readProcessWithExitCode cmd args "")) >>= \case
+    Right a  -> return a
+    Left exn -> throwM exn
 
+logDbg :: (MonadIO m, MonadReader DvdripEnv m) => Text -> m ()
+logDbg msg =
+  whenM (ask <&> view (options . debugging)) $
+  hPutStrLn stderr ("[DEBUG] " ++ msg)
+  
 logMsg :: MonadIO m => Text -> m ()
 logMsg = putStrLn
 
@@ -326,9 +403,32 @@ findFilesPred predicate dir = liftIO $ do
   return $ concat entries'
 
 retrieveVobFiles :: MonadIO m => FilePath -> m [FilePath]
-retrieveVobFiles =
-  findFilesPred isVobFile
+retrieveVobFiles dir =
+  sort <$> findFilesPred isVobFile dir
   where isVobFile = (=~ (".VOB$" :: String))
+
+runDvdrip :: (MonadMask m, MonadIO m, MonadReader DvdripEnv m) => m ()
+runDvdrip = do
+  opts <- view options <$> ask
+  logDbg "Debugging output enabled"
+  if | opts ^. Main.version -> putStrLn (pack programVersion)
+     | opts ^. analyze      -> analyzeDvd
+     | otherwise            -> ripDvd
+  return ()
+
+analyzeDvd :: (MonadMask m, MonadIO m, MonadReader DvdripEnv m) => m ()
+analyzeDvd = do
+  inputFile <- dvdripDvdFile
+  dvd <- retrieveDvdInfo inputFile
+  let dvdTracks  = (dvd ^. tracks) & (filterTracks
+                                      >>> Map.toList
+                                      >>> map (view trackId . snd)
+                                      >>> sort
+                                      >>> map tshow)
+  putStr $ dumpTracksCompact (dvd ^. tracks)
+  putStrLn $ sformat ("Tracks to rip in automatic mode: " % stext % "\n"
+                      % "If that is not desired, specify the tracks manually using `--tracks'")
+                     (intercalate ", " dvdTracks)
 
 ripDvd :: (MonadMask m, MonadIO m, MonadReader DvdripEnv m) => m ()
 ripDvd = do
@@ -336,33 +436,38 @@ ripDvd = do
   inputFile <- dvdripDvdFile
   dvd <- retrieveDvdInfo inputFile
   baseTmpDir <- dvdripTempDir
-  let dvdTracks  = filterTracks (dvd ^. tracks)
-      dvdTracks' = map snd . sortBy (on compare fst) . Map.toList $ dvdTracks
-      nDvdTracks = length dvdTracks'
+  let dvdTracksAll = dvd ^. tracks
+      tracksToRip  =  case env ^. tracks of
+                        Nothing -> dvdTracksAll & filterTracks
+                        Just trackIds -> foldr (\ tId accu ->
+                                                   case Map.lookup tId dvdTracksAll of
+                                                     Just t  -> Map.insert tId t accu
+                                                     Nothing -> accu)
+                                               Map.empty
+                                               trackIds
+      nTracksToRip = Map.size tracksToRip
       offs = fromMaybe 0 (env ^. offset)
       templateTempDir = baseTmpDir ++ "/dvdrip"
-    
-  fmtStringParsed <- parseCustomFormatString <$> dvdripFormatString dvd
-
-  when (nDvdTracks > 1
+  fmtStringParsed <- parseCustomFormatString <$> dvdripFormatString (nTracksToRip > 1)
+  when (nTracksToRip > 1
         && notElem (CustomFormat "i") fmtStringParsed) $
     throwM (DvdException "Multiple tracks to be ripped, but format string does not contain '%i'")
-
   withSystemTempDirectory templateTempDir $ \ tmpDir -> do
-
     logMsg $
       sformat ("Temporary directory: " % string) tmpDir
     logMsg $
-      sformat ("Tracks to rip: " % stext) (tracksPretty dvdTracks)
-    forM_ (zip [offs..] dvdTracks') $ \ (idx, track) -> do
+      sformat ("Tracks to rip: " % stext) (tracksPretty tracksToRip)
+    forM_ (zip [offs..] (map snd (Map.toList tracksToRip))) $ \ (idx, track) -> do
       formatDict <- createCustomFormatDict dvd idx
       let outputName = constructFormatted formatDict fmtStringParsed
-      ripTrack tmpDir outputName track
-
+      processTrack tmpDir outputName track
+  logMsg "Done"
+  
   where tracksPretty :: Map Int Track -> Text
-        tracksPretty =
-          intercalate ", " . map tshow . Map.keys
-
+        tracksPretty trackMap =
+          case Map.keys trackMap of
+            []        -> "(none)"
+            trackKeys -> intercalate ", " . map tshow $ trackKeys
         
 constructOutputName :: String -> String -> Maybe Int -> FilePath
 constructOutputName name suffix maybeIdx =
@@ -422,7 +527,6 @@ parseCustomFormatString = go []
 
 constructFormatted :: Map Text Text -> [CustomFormat] -> Text
 constructFormatted dict = concatMap evalCustomFormat
-
   where evalCustomFormat (CustomFormatLiteral s) = s
         evalCustomFormat (CustomFormat s) =
           fromMaybe "" (Map.lookup s dict)
@@ -446,10 +550,9 @@ dvdripOutputDir = do
   dir <- _dvdripEnvWorkingDir <$> ask
   fromMaybe dir . view (options . outputDir) <$> ask
 
-dvdripFormatString :: MonadReader DvdripEnv m => DvdInfo -> m Text
-dvdripFormatString dvd = do
-  let multiTracks = length (_dvdInfoTracks dvd) > 1
-      defaultFormat = if multiTracks
+dvdripFormatString :: MonadReader DvdripEnv m => Bool -> m Text
+dvdripFormatString multiTracks = do
+  let defaultFormat = if multiTracks
                       then "%t - %i"
                       else "%t"
   fromMaybe defaultFormat . view (options . formatString) <$> ask
@@ -459,17 +562,24 @@ parseOffset Nothing = return Nothing
 parseOffset (Just t) =
   case readMay t of
     Just n  -> return $ Just n
-    Nothing -> throwM $
-      DvdException (sformat ("Invalid track offset: `" % stext % "'") t)
+    Nothing -> throwM $ DvdException invalidOffsetMsg
+  where invalidOffsetMsg = sformat ("Invalid track offset: `" % stext % "'") t
 
 parseLanguages :: MonadThrow m => Maybe Text -> m (Maybe [Text])
 parseLanguages Nothing = return Nothing
 parseLanguages (Just t) =
   t & (Text.splitOn ","
        >>> map Text.strip
-       >>> map (`Map.lookup` languageDb)
+       >>> Just
+       >>> return)
+
+parseTracks :: MonadThrow m => Maybe Text -> m (Maybe [Int])
+parseTracks Nothing = return Nothing
+parseTracks (Just t) =
+  t & (Text.splitOn ","
+       >>> map Text.strip
+       >>> map readMay
        >>> catMaybes
-       >>> concat
        >>> Just
        >>> return)
 
@@ -478,31 +588,17 @@ main' opts = do
   dir <- getCurrentDirectory
   maybeOffset <- parseOffset (opts ^. offset)
   maybeLanguages <- parseLanguages (opts ^. languages)
+  maybeTracks <- parseTracks (opts ^. tracks)
   let env = DvdripEnv { _dvdripEnvOptions = opts
                       , _dvdripEnvOffset = maybeOffset
                       , _dvdripEnvWorkingDir = dir
-                      , _dvdripEnvLanguages = maybeLanguages }
-  try (runReaderT ripDvd env) >>= \case
-    Right () -> logMsg "Done"
+                      , _dvdripEnvLanguages = maybeLanguages
+                      , _dvdripEnvTracks = maybeTracks }
+  try (runReaderT runDvdrip env) >>= \case
+    Right () -> return ()
     Left exn ->
       logErr $
         sformat ("Failure: " % stext) (tshow (exn :: SomeException))
-
--- | The name of the program.
-programName :: String
-programName = "dvdrip"
-
--- | The version of the program.
-programVersion :: String
-programVersion = showVersion version
-
--- | Short description of the program.
-programDescriptionShort :: String
-programDescriptionShort = "Video DVD Ripper"
-
--- | Short description of the program.
-programDescription :: String
-programDescription = "Command line wrapper for lsdvd, dvdbackup and ffmpeg"
 
 dvdripOptions :: Opts.Parser DvdripOptions
 dvdripOptions = DvdripOptions
@@ -537,12 +633,23 @@ dvdripOptions = DvdripOptions
        (Opts.strOption (Opts.long "audio-lang"
                         Opts.<> Opts.metavar "LANGUAGE LIST"
                         Opts.<> Opts.help "Specify languages")))
-
-languageDb :: Map Text [Text]
-languageDb = Map.fromList
-  [ ("de", ["de", "DE", "ger", "GERMAN"])
-  , ("en", ["en", "EN", "english", "ENGLISH"])
-  ]
+  <*> (fmap pack <$> Opts.optional
+       (Opts.strOption (Opts.long "scp-to"
+                        Opts.<> Opts.metavar "SCP DESTINATION"
+                        Opts.<> Opts.help "Specify destination for secure copy")))
+  <*> (Opts.switch
+        (Opts.long "debug"
+         Opts.<> Opts.help "Enable debugging output"))
+  <*> (Opts.switch
+       (Opts.long "analyze"
+        Opts.<> Opts.help "Analyze DVD"))
+  <*> (fmap pack <$> Opts.optional
+       (Opts.strOption (Opts.long "tracks"
+                        Opts.<> Opts.metavar "LIST OF TRACKS"
+                        Opts.<> Opts.help "Specify tracks")))
+  <*> (Opts.switch
+       (Opts.long "version"
+        Opts.<> Opts.help "Show version"))
 
 main :: IO ()
 main = main' =<<
