@@ -285,8 +285,8 @@ processTrack tmpDir outputName track = do
 
 sendFile :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
 sendFile file scpDest =
-  (liftIO $ withActivityIcon' $
-    readProcessWithExitCode "scp" ["-q", file, unpack scpDest]) "" >>= \case
+  liftIO (withActivityIcon' $
+           readProcessWithExitCode "scp" ["-q", file, unpack scpDest] "") >>= \case
     Right (cmdExit, _, cmdStderr) ->
       when (cmdExit /= ExitSuccess) $ do
       logErr "Failed to transmit encoded file via scp."
