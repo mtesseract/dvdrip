@@ -291,10 +291,11 @@ processTrack tmpDir outputName track = do
 
   ripTrack tmpDir outDir inputFile outputNameSuffixed track
   maybe (return ()) (sendFile outputFile) (env ^. options . scpDestination)
-  where suffix = "mkv"
+  where suffix = "mp4"
 
 sendFile :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
-sendFile file scpDest =
+sendFile file scpDest = do
+  logMsg $ sformat ("Sending encoded file to " % stext) scpDest
   liftIO (withActivityIcon' $
            readProcessWithExitCode "scp" ["-q", file, unpack scpDest] "") >>= \case
     Right (cmdExit, _, cmdStderr) ->
@@ -378,8 +379,8 @@ trackEncode audioTrack inputFiles outputFile = do
              , "-i", inputFileSpec
              , "-map", "0:v"
              , "-c:v", "libx264"
-             , "-preset", "ultrafast"
-             , "-crf", "0"
+             , "-crf", "19"
+             , "-preset", "slow"
              , "-map", audioStreamSpec
              , outputFile ]
   logDbg $ sformat (string % " " % string) cmd (unwords args)
