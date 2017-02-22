@@ -39,7 +39,7 @@ data DvdInfo =
 data Track =
   Track { _trackTrackLength :: Double -- In minutes.
         , _trackTrackId     :: Int
-        , _trackAudio       :: Map Text TrackAudio
+        , _trackAudio       :: Map Int TrackAudio
         } deriving (Show)
 
 data TrackAudio =
@@ -49,11 +49,13 @@ data TrackAudio =
 
 
 data DvdripEnv =
-  DvdripEnv { _dvdripEnvOptions    :: DvdripOptions
-            , _dvdripEnvOffset     :: Maybe Int
-            , _dvdripEnvWorkingDir :: FilePath
-            , _dvdripEnvLanguages  :: Maybe [Text]
-            , _dvdripEnvTracks     :: Maybe [Int]}
+  DvdripEnv { _dvdripEnvOptions      :: DvdripOptions
+            , _dvdripEnvOffset       :: Maybe Int
+            , _dvdripEnvWorkingDir   :: FilePath
+            , _dvdripEnvLanguages    :: Maybe [Text]
+            , _dvdripEnvTracks       :: Maybe [Int]
+            , _dvdripEnvAudioTrackId :: Maybe Int
+            }
 
 data DvdripOptions =
   DvdripOptions { _dvdripOptionsDvdFile        :: Maybe FilePath
@@ -63,6 +65,7 @@ data DvdripOptions =
                 , _dvdripOptionsOffset         :: Maybe Text
                 , _dvdripOptionsFormatString   :: Maybe Text
                 , _dvdripOptionsLanguages      :: Maybe Text
+                , _dvdripOptionsAudioTrackId   :: Maybe Text
                 , _dvdripOptionsScpDestination :: Maybe Text
                 , _dvdripOptionsDebugging      :: Bool
                 , _dvdripOptionsAnalyze        :: Bool
@@ -162,9 +165,9 @@ parseTrack node@(NodeElement elt) = do
   trackLengthS <- extractNodeContent =<< listToMaybe (elementNodes trackLengthElt)
   videoTrackLen  <- readMay trackLengthS
   videoTrackId <- readMay =<< retrieveSubnodeContentByName node "ix"
-  let audioStreams = mapMaybe parseAudioStream subNodes
+  let audioStreams    = mapMaybe parseAudioStream subNodes
       audioStreamsMap = Map.fromList $
-        map (\ stream -> (stream ^. language, stream)) audioStreams
+        map (\ stream -> (stream ^. streamId, stream)) audioStreams
   return Track { _trackTrackLength = videoTrackLen
                , _trackTrackId     = videoTrackId
                , _trackAudio       = audioStreamsMap }
@@ -233,29 +236,36 @@ filterTracks videoTracks =
   where trackLongerThan threshold track =
           track ^. trackLength >= threshold
 
-dumpTracks :: Map Int Track -> Text
-dumpTracks videoTracks =
-  let videoTracks' = sortBy (on compare fst) $ Map.toList videoTracks
-  in concatMap dumpTrack videoTracks'
+-- dumpTracks :: Map Int Track -> Text
+-- dumpTracks videoTracks =
+--   let videoTracks' = sortBy (on compare fst) $ Map.toList videoTracks
+--   in concatMap dumpTrack videoTracks'
 
-  where dumpTrack (_, t) =
-          tshow (t ^. trackId) ++ " -> " ++ tshow (t ^. trackLength) ++ "\n"
-          ++ "Audio Streams: " ++ "\n" ++ dumpAudioStreams (t ^. audio) ++ "\n"
+--   where dumpTrack (_, t) =
+--           tshow (t ^. trackId) ++ " -> " ++ tshow (t ^. trackLength) ++ "\n"
+--           ++ "Audio Streams: " ++ "\n" ++ dumpAudioStreams (t ^. audio) ++ "\n"
 
-        dumpAudioStreams :: Map Text TrackAudio -> Text
-        dumpAudioStreams =
-          intercalate "\n"
-          . map (\ (lang, audioStream) ->
-                    "  " ++ lang ++ " -> " ++ tshow (audioStream ^. streamId))
-          . Map.toList
+--         dumpAudioStreams :: Map Text TrackAudio -> Text
+--         dumpAudioStreams =
+--           intercalate "\n"
+--           . map (\ (lang, audioStream) ->
+--                     "  " ++ lang ++ " -> " ++ tshow (audioStream ^. streamId))
+--           . Map.toList
 
+prettyPrintAudioTrackLanguages :: Map Int TrackAudio -> Text
+prettyPrintAudioTrackLanguages =
+  Map.toList
+  >>> map snd
+  >>> map (\ t -> sformat (stext % "(" % stext % ")") (tshow (t ^. streamId)) (t ^. language))
+  >>> intercalate ", "
+  
 dumpTracksCompact :: Map Int Track -> Text
 dumpTracksCompact videoTracks =
   let videoTracks' = sortBy (on compare fst) $ Map.toList videoTracks
   in concatMap (dumpTrack . snd) videoTracks'
 
   where dumpTrack t =
-          let langs = intercalate ", " (Map.keys (t ^. audio))
+          let langs = prettyPrintAudioTrackLanguages (t ^. audio)
           in sformat ("[Track #" % int % "] length = " % float % "min" % stext % "\n")
              (t ^. trackId)
              (t ^. trackLength)
@@ -339,12 +349,14 @@ ripTrack tmpDir outDir inputFile outputName track = do
 
 retrieveAudioTrack :: MonadReader DvdripEnv m
                    => Track -> m (Maybe TrackAudio)
-retrieveAudioTrack track = ask <&>
-  (view languages
-   >>> fromMaybe []
-   >>> map (`Map.lookup` (track ^. audio))
-   >>> catMaybes
-   >>> listToMaybe)
+retrieveAudioTrack track = do
+  env <- ask
+  return $ (maybe Nothing (`Map.lookup` (track ^. audio)) (env ^. audioTrackId)
+             <|> maybe Nothing
+                       (\ langs ->
+                          (listToMaybe . filter (\a -> (a ^. language) `elem` langs) . Map.elems) (track ^. audio))
+                       (env ^. languages)
+             <|> (listToMaybe . map snd . sortBy (on compare fst) . Map.toList) (track ^. audio))
 
 dvdBackup :: (MonadReader DvdripEnv m, MonadThrow m, MonadIO m)
           => Track -> FilePath -> FilePath -> m (ExitCode, ByteString, ByteString)
@@ -366,6 +378,8 @@ trackEncode audioTrack inputFiles outputFile = do
              , "-i", inputFileSpec
              , "-map", "0:v"
              , "-c:v", "libx264"
+             , "-preset", "ultrafast"
+             , "-crf", "0"
              , "-map", audioStreamSpec
              , outputFile ]
   logDbg $ sformat (string % " " % string) cmd (unwords args)
@@ -422,13 +436,30 @@ analyzeDvd = do
   dvd <- retrieveDvdInfo inputFile
   let dvdTracks  = (dvd ^. tracks) & (filterTracks
                                       >>> Map.toList
-                                      >>> map (view trackId . snd)
-                                      >>> sort
-                                      >>> map tshow)
+                                      >>> map snd)
+      dvdTrackIds = dvdTracks & (map (view trackId)
+                                 >>> sort
+                                 >>> map tshow)
   putStr $ dumpTracksCompact (dvd ^. tracks)
   putStrLn $ sformat ("Tracks to rip in automatic mode: " % stext % "\n"
                       % "If that is not desired, specify the tracks manually using `--tracks'")
-                     (intercalate ", " dvdTracks)
+                     (intercalate ", " dvdTrackIds)
+  putStrLn "Selection of audio tracks for each video track:"
+  forM_ dvdTracks $ \ vidTrack -> do
+    retrieveAudioTrack vidTrack >>= \case
+      Just t -> do
+        let cmd = "mplayer"
+            args = [ "-aid", tshow (t ^. streamId)
+                   , "-nosub"
+                   , "-dvd-device", "'" ++ pack inputFile ++ "'" -- FIXME, more robust way?
+                   , "dvd://" ++ tshow (vidTrack ^. trackId) ]
+        putStrLn $ sformat ("#" % stext % " -> " % stext)
+                           (tshow (t ^. streamId))
+                           (sformat (stext % "(" % stext % ")") (tshow (t ^. streamId)) (t ^. language))
+        putStrLn $ sformat ("Preview command: " % stext)
+                           (unwords (cmd:args))
+      Nothing ->
+        logErr "No audio track found!"
 
 ripDvd :: (MonadMask m, MonadIO m, MonadReader DvdripEnv m) => m ()
 ripDvd = do
@@ -583,17 +614,26 @@ parseTracks (Just t) =
        >>> Just
        >>> return)
 
+parseAudioTrackId :: MonadThrow m => Maybe Text -> m (Maybe Int)
+parseAudioTrackId Nothing = return Nothing
+parseAudioTrackId (Just t) =
+  case readMay t of
+    Just tId -> return (Just tId)
+    Nothing  -> throwM (DvdException "Invalid audio track ID given")
+
 main' :: DvdripOptions -> IO ()
 main' opts = do
   dir <- getCurrentDirectory
   maybeOffset <- parseOffset (opts ^. offset)
   maybeLanguages <- parseLanguages (opts ^. languages)
   maybeTracks <- parseTracks (opts ^. tracks)
+  maybeAudioTrackId <- parseAudioTrackId (opts ^. audioTrackId)
   let env = DvdripEnv { _dvdripEnvOptions = opts
                       , _dvdripEnvOffset = maybeOffset
                       , _dvdripEnvWorkingDir = dir
                       , _dvdripEnvLanguages = maybeLanguages
-                      , _dvdripEnvTracks = maybeTracks }
+                      , _dvdripEnvTracks = maybeTracks
+                      , _dvdripEnvAudioTrackId = maybeAudioTrackId }
   try (runReaderT runDvdrip env) >>= \case
     Right () -> return ()
     Left exn ->
@@ -633,6 +673,10 @@ dvdripOptions = DvdripOptions
        (Opts.strOption (Opts.long "audio-lang"
                         Opts.<> Opts.metavar "LANGUAGE LIST"
                         Opts.<> Opts.help "Specify languages")))
+  <*> (fmap pack <$> Opts.optional
+       (Opts.strOption (Opts.long "audio-track"
+                        Opts.<> Opts.metavar "ID"
+                        Opts.<> Opts.help "Specify audio track")))
   <*> (fmap pack <$> Opts.optional
        (Opts.strOption (Opts.long "scp-to"
                         Opts.<> Opts.metavar "SCP DESTINATION"
