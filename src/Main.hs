@@ -38,7 +38,7 @@ data DvdInfo =
           } deriving (Show)
 
 data Track =
-  Track { _trackTrackLength :: Double -- In minutes.
+  Track { _trackTrackLength :: Double -- In seconds.
         , _trackTrackId     :: Int
         , _trackAudio       :: Map Int TrackAudio
         } deriving (Show)
@@ -270,9 +270,9 @@ dumpTracksCompact videoTracks =
 
   where dumpTrack t =
           let langs = prettyPrintAudioTrackLanguages (t ^. audio)
-          in sformat ("[Track #" % int % "] length = " % float % "min" % stext % "\n")
+          in sformat ("[Track #" % int % "] length = " % fixed 2 % "min" % stext % "\n")
              (t ^. trackId)
-             (t ^. trackLength)
+             (t ^. trackLength / 60)
              (if null langs
               then ""
               else sformat (", languages = " % stext) langs)
@@ -310,7 +310,6 @@ sendFile file scpDest = do
       throwM (DvdException "Failed command: scp")
     Left exn -> throwM exn
   
-
 ripTrack :: (MonadIO m, MonadReader DvdripEnv m, MonadCatch m)
          => FilePath -> FilePath -> FilePath -> FilePath -> Track -> m ()
 ripTrack tmpDir outDir inputFile outputName track = do
