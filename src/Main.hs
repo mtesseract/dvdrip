@@ -30,6 +30,7 @@ import Control.Lens
 import Control.Arrow ((>>>))
 import Data.List.NonEmpty (NonEmpty(..))
 import Paths_dvdrip
+import qualified Data.Text.Encoding as Text
 
 data DvdInfo =
   DvdInfo { _dvdInfoTitle  :: Text
@@ -137,7 +138,10 @@ retrieveDvdInfo inputFile = do
   
 parseDvdInfo :: (MonadReader DvdripEnv m, MonadThrow m) => ByteString -> m DvdInfo
 parseDvdInfo bs = do
-  Document _ root _ <- either throwM return $ parseLBS def (fromStrict bs)
+  -- Workaround for broken lsdvd, which sometimes returns invalid Utf8
+  -- data. We simply replace invalid bytes with '?'.
+  let xmlData = Text.decodeUtf8With (\ _ _ -> Just '?') bs
+  Document _ root _ <- either throwM return $ parseText def (fromStrict xmlData)
   require "Node not found: lsdvd" $
     (nameLocalName . elementName) root == "lsdvd"
   let subNodes = elementNodes root
