@@ -289,19 +289,19 @@ processTrack tmpDir outputName track = do
   logDbg $ sformat "Processing track"
   env <- ask
   inputFile <- dvdripDvdFile
-  outDir <- dvdripOutputDir
-  let outputNameSuffixed = unpack outputName ++ "." ++ suffix
-      outputFile = outDir </> outputNameSuffixed
-
+  outDir <- dvdripOutputDir <&> (</> outputName')
+  liftIO $ createDirectoryIfMissing True outDir
   ripTrack tmpDir outDir inputFile outputNameSuffixed track
-  maybe (return ()) (sendFile outputFile) (env ^. options . scpDestination)
-  where suffix = "mp4"
+  maybe (return ()) (sendRecursively outDir) (env ^. options . scpDestination)
+  where outputName' = unpack outputName
+        outputNameSuffixed = outputName' ++ "." ++ suffix
+        suffix = "mp4"
 
-sendFile :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
-sendFile file scpDest = do
+sendRecursively :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
+sendRecursively file scpDest = do
   logMsg $ sformat ("Sending encoded file to " % stext) scpDest
   liftIO (withActivityIcon' $
-           readProcessWithExitCode "scp" ["-q", file, unpack scpDest] "") >>= \case
+           readProcessWithExitCode "scp" ["-q", "-r", file, unpack scpDest] "") >>= \case
     Right (cmdExit, _, cmdStderr) ->
       when (cmdExit /= ExitSuccess) $ do
       logErr "Failed to transmit encoded file via scp."
@@ -458,7 +458,7 @@ analyzeDvd = do
                    , "-dvd-device", "'" ++ pack inputFile ++ "'" -- FIXME, more robust way?
                    , "dvd://" ++ tshow (vidTrack ^. trackId) ]
         putStrLn $ sformat ("#" % stext % " -> " % stext)
-                           (tshow (t ^. streamId))
+                           (tshow (vidTrack ^. trackId))
                            (sformat (stext % "(" % stext % ")") (tshow (t ^. streamId)) (t ^. language))
         putStrLn $ sformat ("Preview command: " % stext)
                            (unwords (cmd:args))
