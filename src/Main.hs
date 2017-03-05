@@ -11,7 +11,7 @@ module Main where
 
 import ClassyPrelude
 import Data.Version
-import Text.XML
+import Text.XML (Node(..), Document(..), Element(..), nameLocalName, def, parseText)
 import qualified Data.Map as Map
 import Control.Concurrent.Async.Timer
 import Control.Concurrent.Async.Lifted.Safe (poll)
@@ -29,6 +29,7 @@ import qualified Options.Applicative as Opts
 import Control.Lens
 import Control.Arrow ((>>>))
 import Data.List.NonEmpty (NonEmpty(..))
+import System.FilePath (takeDirectory)
 import Paths_dvdrip
 import qualified Data.Text.Encoding as Text
 
@@ -289,13 +290,21 @@ processTrack tmpDir outputName track = do
   logDbg $ sformat "Processing track"
   env <- ask
   inputFile <- dvdripDvdFile
-  outDir <- dvdripOutputDir <&> (</> outputName')
+  outDir <- dvdripOutputDir
   liftIO $ createDirectoryIfMissing True outDir
-  ripTrack tmpDir outDir inputFile outputNameSuffixed track
-  maybe (return ()) (sendRecursively outDir) (env ^. options . scpDestination)
+  ripTrack tmpDir outDir inputFile outputName' track
+  case env ^. options . scpDestination of
+    Just scpDest -> sendRecursively (outDir </> outputName') scpDest
+    Nothing      -> return ()
   where outputName' = unpack outputName
-        outputNameSuffixed = outputName' ++ "." ++ suffix
-        suffix = "mp4"
+
+constructTmpFileName :: FilePath -> FilePath -> FilePath
+constructTmpFileName tmpDir name =
+  tmpDir </> (name ++ defaultVideoSuffix)
+
+constructOutputFileName :: FilePath -> FilePath -> FilePath
+constructOutputFileName outDir name =
+  outDir </> name </> (name ++ defaultVideoSuffix)
 
 sendRecursively :: (MonadThrow m, MonadIO m) => FilePath -> Text -> m ()
 sendRecursively file scpDest = do
@@ -313,13 +322,13 @@ sendRecursively file scpDest = do
 ripTrack :: (MonadIO m, MonadReader DvdripEnv m, MonadCatch m)
          => FilePath -> FilePath -> FilePath -> FilePath -> Track -> m ()
 ripTrack tmpDir outDir inputFile outputName track = do
-  let tmpDirVob = tmpDir </> "VOB"
-      tmpOutputFile = tmpDir </> outputName
-      outputFile = outDir </> outputName
-  liftIO $ unlessM (doesDirectoryExist tmpDirVob) $
-    createDirectory tmpDirVob
-  logMsg $
-    sformat ("Ripping track no. " % int) (track ^. trackId)
+  let tmpDirVob     = tmpDir </> ("VOB" ++ show (track ^. trackId))
+      tmpOutputFile = constructTmpFileName tmpDir outputName
+      outputFile    = constructOutputFileName outDir outputName
+  liftIO $ do
+    createDirectoryIfMissing True tmpDirVob
+    createDirectoryIfMissing True (takeDirectory outDir)
+  logMsg $ sformat ("Ripping track no. " % int) (track ^. trackId)
   dvdBackupRes <- try $ dvdBackup track inputFile tmpDirVob
   case dvdBackupRes of
     Right (dvdBackupExit, _, dvdBackupStderr) ->
@@ -431,7 +440,7 @@ runDvdrip = do
   logDbg "Debugging output enabled"
   if | opts ^. Main.version -> putStrLn (pack programVersion)
      | opts ^. analyze      -> analyzeDvd
-     | otherwise            -> ripDvd
+     | otherwise            -> do ripDvd
   return ()
 
 analyzeDvd :: (MonadMask m, MonadIO m, MonadReader DvdripEnv m) => m ()
@@ -495,6 +504,7 @@ ripDvd = do
     forM_ (zip [offs..] (map snd (Map.toList tracksToRip))) $ \ (idx, track) -> do
       formatDict <- createCustomFormatDict dvd idx
       let outputName = constructFormatted formatDict fmtStringParsed
+      testOutputDirectory tmpDir outputName
       processTrack tmpDir outputName track
   logMsg "Done"
   
@@ -706,3 +716,20 @@ main = main' =<<
     (Opts.fullDesc
       Opts.<> Opts.progDesc programDescription
       Opts.<> Opts.header (programName ++ " - " ++ programDescriptionShort)))
+
+defaultVideoSuffix :: FilePath
+defaultVideoSuffix = ".mp4"
+
+testOutputDirectory :: (MonadReader DvdripEnv m, MonadIO m)
+                    => FilePath -> Text -> m ()
+testOutputDirectory tmpDir outputName = do
+  outDir <- dvdripOutputDir
+  let testFileName   = constructTmpFileName tmpDir outputName'
+      outputFileName = constructOutputFileName outDir outputName'
+  liftIO $ do
+    createDirectoryIfMissing True (takeDirectory testFileName)
+    createDirectoryIfMissing True (takeDirectory outputFileName)
+    writeFile testFileName ("" :: Text)
+    renameFile testFileName outputFileName
+  
+  where outputName' = unpack outputName

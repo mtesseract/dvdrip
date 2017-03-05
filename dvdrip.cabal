@@ -36,4 +36,5 @@ executable dvdrip
                      , regex-tdfa
                      , text
                      , optparse-applicative
+                     , filepath
   other-modules:       Paths_dvdrip
